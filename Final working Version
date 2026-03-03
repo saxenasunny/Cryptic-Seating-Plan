@@ -2184,5 +2184,5 @@ function resetDutyAllocation() {
     const sheet = ss.getSheetByName(sheetName);
     if (sheet) ss.deleteSheet(sheet);
   });
-  ui.alert('✓ Duty allocation reset successfully!');
+  ui.alert('✓ Duty allocation reset successfully! Now you can run the allocation process again with updated data.');
 }
