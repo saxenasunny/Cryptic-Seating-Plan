@@ -1,0 +1,2188 @@
+/**
+ * EXAM SEATING PLAN GENERATOR - COMPLETE SYSTEM - FINAL VERSION
+ * 
+ * Features: Seating allocation, Date sheet generation, PDF export, Master sheet, Duty allocation
+ * 
+ * LATEST ENHANCEMENTS (Attendance Sheets):
+ * - Student name column: Wrap text enabled
+ * - Course name column added with wrap text
+ * - 5 attendance statistics fields added at bottom
+ */
+
+// ============= CONFIGURATION =============
+const CONFIG = {
+  STUDENT_SHEET: 'Students_Input',
+  ROOM_SHEET: 'Room Data',
+  CONTROL_SHEET: 'Control Panel',
+  OUTPUT_SHEET: 'Seating Arrangement',
+  
+  STUDENT_COLS: {
+    ROLL_NO: 0,
+    Name: 1,
+    Section: 2,
+    COURSE_NAME: 3,
+    SUBJECT_CODE: 4,
+    SUBJECT_NAME: 5,
+    EXAM_DATE: 6,
+    SESSION: 7
+  },
+  
+  ROOM_COLS: {
+    ROOM_NO: 0,
+    TOTAL_ROWS: 1,
+    TOTAL_COLUMNS: 2
+  },
+  
+  CONTROL_CELLS: {
+    EXAM_DATE: 'B1',
+    SESSION: 'B2',
+    EXAM_TITLE: 'B3',
+    FOLDER_ID: 'B4',
+    MAX_SUBJECTS_PER_ROOM: 'B5'  // ← NEW: Optional limit (leave blank for unlimited)
+  },
+  
+  LOGO_FILE_ID: "1QwXbRA6Wa6EjcNiGp7R-vbe7kdWDm2sh",
+  LOGO_WIDTH: 90,
+  LOGO_HEIGHT: 50
+};
+
+// ============= MENU =============
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('📋 Exam Seating')
+    .addItem('📍 Map Students with Subjects','compileStudentSubjects_FAST')
+    .addSeparator()
+    .addItem('🗓️ Check Date Clashing','detectExamClashes_FAST')
+    .addSeparator()
+    .addItem('📅 Generate Date Sheet','generateDateSheet')
+    .addItem('📄 Export Date Sheet to PDF','exportDateSheetsToPDF')
+    .addSeparator()
+    .addItem('🎯 Generate Seating Plan', 'generateSeatingPlan')
+    .addItem('📋 Generate Master Sheet', 'generateMasterSheet')
+    .addItem('📝 Generate Attendance Sheets', 'generateAttendanceSheets')
+    .addSeparator()
+    .addItem('👥 Generate Duty Allocation', 'generateDutyAllocation')
+    .addItem('📋 Create Duty Templates', 'createDutyAllocationTemplates')
+    .addItem('🔄 Reset Duty Allocation', 'resetDutyAllocation')
+    .addSeparator()
+    .addItem('📊 View Statistics', 'showStatistics')
+    .addToUi();
+}
+
+// ============= SEATING PLAN GENERATION =============
+function generateSeatingPlan() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    clearOldSeatingOutputs_(ss);
+    Logger.log('=== Starting Seating Plan Generation ===');
+    
+    const controlData = readControlPanel(ss);
+    const students = getEligibleStudents(ss, controlData);
+    
+    if (students.length === 0) {
+      SpreadsheetApp.getUi().alert('No students found for the selected date and session!');
+      return;
+    }
+    
+    const rooms = readRoomData(ss);
+    const subjectGroups = groupStudentsBySubject(students);
+    const seatingPlan = allocateSeats(subjectGroups, rooms, controlData.maxSubjectsPerRoom);  // ← ADDED parameter
+    
+    writeSeatingPlan(ss, seatingPlan, controlData);
+    writeEachRoomAsSeparateSheet(ss, seatingPlan, controlData);
+    
+    if (controlData.folderId) {
+      exportSheetsToDriveFolder(ss, seatingPlan, controlData);
+    }
+    
+    SpreadsheetApp.getUi().alert('✓ Seating Plan Generated Successfully!\n\n' +
+      'Total Students: ' + students.length + '\n' +
+      'Rooms Used: ' + seatingPlan.length);
+    
+    Logger.log('=== Seating Plan Generation Complete ===');
+    
+  } catch (error) {
+    Logger.log('ERROR: ' + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+function readControlPanel(ss) {
+  const sheet = ss.getSheetByName(CONFIG.CONTROL_SHEET);
+  const maxSubjectsCell = sheet.getRange(CONFIG.CONTROL_CELLS.MAX_SUBJECTS_PER_ROOM).getValue();
+  const maxSubjectsPerRoom = maxSubjectsCell && !isNaN(parseInt(maxSubjectsCell)) ? parseInt(maxSubjectsCell) : null;
+  
+  return {
+    examDate: sheet.getRange(CONFIG.CONTROL_CELLS.EXAM_DATE).getValue(),
+    session: sheet.getRange(CONFIG.CONTROL_CELLS.SESSION).getValue(),
+    examTitle: sheet.getRange(CONFIG.CONTROL_CELLS.EXAM_TITLE).getValue(),
+    folderId: sheet.getRange(CONFIG.CONTROL_CELLS.FOLDER_ID).getValue(),
+    maxSubjectsPerRoom: maxSubjectsPerRoom  // ← NEW: null = unlimited
+  };
+}
+
+function getEligibleStudents(ss, controlData) {
+  const sheet = ss.getSheetByName(CONFIG.STUDENT_SHEET);
+  const data = sheet.getDataRange().getValues();
+  const students = [];
+  const targetDate = formatDate(controlData.examDate);
+  const targetSession = controlData.session.toString().trim().toUpperCase();
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[CONFIG.STUDENT_COLS.ROLL_NO]) continue;
+    
+    const examDate = formatDate(row[CONFIG.STUDENT_COLS.EXAM_DATE]);
+    const session = row[CONFIG.STUDENT_COLS.SESSION].toString().trim().toUpperCase();
+    
+    if (examDate === targetDate && session === targetSession) {
+      students.push({
+        rollNo: row[CONFIG.STUDENT_COLS.ROLL_NO],
+        section: row[CONFIG.STUDENT_COLS.Section],
+        courseName: row[CONFIG.STUDENT_COLS.COURSE_NAME],
+        subjectCode: row[CONFIG.STUDENT_COLS.SUBJECT_CODE],
+        subjectName: row[CONFIG.STUDENT_COLS.SUBJECT_NAME],
+        examDate: row[CONFIG.STUDENT_COLS.EXAM_DATE],
+        session: row[CONFIG.STUDENT_COLS.SESSION]
+      });
+    }
+  }
+  return students;
+}
+
+function readRoomData(ss) {
+  const sheet = ss.getSheetByName(CONFIG.ROOM_SHEET);
+  const data = sheet.getDataRange().getValues();
+  const rooms = [];
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    if (!row[CONFIG.ROOM_COLS.ROOM_NO]) continue;
+    
+    rooms.push({
+      roomNo: row[CONFIG.ROOM_COLS.ROOM_NO],
+      totalRows: parseInt(row[CONFIG.ROOM_COLS.TOTAL_ROWS]),
+      totalColumns: parseInt(row[CONFIG.ROOM_COLS.TOTAL_COLUMNS]),
+      capacity: parseInt(row[CONFIG.ROOM_COLS.TOTAL_ROWS]) * parseInt(row[CONFIG.ROOM_COLS.TOTAL_COLUMNS])
+    });
+  }
+  return rooms;
+}
+
+function groupStudentsBySubject(students) {
+  const groups = {};
+  students.forEach(student => {
+    const key = student.subjectCode;
+    if (!groups[key]) groups[key] = [];
+    groups[key].push(student);
+  });
+  return groups;
+}
+
+// ============= SEATING ALLOCATION =============
+function allocateSeats(subjectGroups, rooms, maxSubjectsPerRoom) {  // ← ADDED parameter
+  const seatingPlan = [];
+  const subjects = Object.keys(subjectGroups).sort((a, b) => subjectGroups[b].length - subjectGroups[a].length);
+  const subjectQueues = {};
+  subjects.forEach(s => { subjectQueues[s] = subjectGroups[s].slice(); });
+
+  let roomIndex = 0;
+
+  while (hasRemainingStudents(subjectQueues)) {
+    if (roomIndex >= rooms.length) {
+      var remaining = getTotalRemainingStudents(subjectQueues);
+      var refRoom = rooms[0];
+      var gapCap = Math.ceil(refRoom.totalRows * refRoom.totalColumns / 2);
+      var needed = roomIndex + Math.ceil(remaining / gapCap);
+      throw new Error(
+        'Not enough rooms! ' + remaining + ' students still unallocated. ' +
+        'Need ' + needed + ' rooms total, but only ' + rooms.length + ' are available.'
+      );
+    }
+
+    var room = rooms[roomIndex];
+    var roomSeating = {
+      roomNo: room.roomNo,
+      totalRows: room.totalRows,
+      totalColumns: room.totalColumns,
+      seats: []
+    };
+
+    // *** NEW: Select subjects for this room (respecting limit if set) ***
+    var roomSubjects = selectSubjectsForRoom(subjectQueues, maxSubjectsPerRoom);
+    
+    if (roomSubjects.length === 0) break;
+    
+    var largest = roomSubjects[0];
+    var others = roomSubjects.slice(1);
+    
+    // Check if gap mode needed (only largest subject has students in selected batch)
+    var gapMode = (others.length === 0 || !others.some(s => subjectQueues[s].length > 0));
+
+    if (!gapMode) {
+      var otherRoundRobin = 0;
+      fillRoomAlternating(roomSeating, subjectQueues, largest, others, otherRoundRobin, room);
+    } else {
+      fillRoomWithGaps(roomSeating, subjectQueues[largest], room);
+    }
+
+    seatingPlan.push(roomSeating);
+    roomIndex++;
+  }
+  return seatingPlan;
+}
+
+// *** NEW HELPER FUNCTION: Select subjects for current room ***
+function selectSubjectsForRoom(subjectQueues, maxSubjectsPerRoom) {
+  // Get all subjects that still have students
+  var availableSubjects = Object.keys(subjectQueues)
+    .filter(s => subjectQueues[s].length > 0)
+    .sort((a, b) => subjectQueues[b].length - subjectQueues[a].length);
+  
+  // If no limit set (null/undefined), return all available subjects
+  if (!maxSubjectsPerRoom) {
+    return availableSubjects;
+  }
+  
+  // Otherwise, return only up to the limit (Strategy A: Fill room completely with limited subjects)
+  return availableSubjects.slice(0, maxSubjectsPerRoom);
+}
+
+// *** NEW HELPER FUNCTION: Count total remaining students ***
+function getTotalRemainingStudents(subjectQueues) {
+  return Object.values(subjectQueues).reduce((sum, queue) => sum + queue.length, 0);
+}
+
+function fillRoomAlternating(roomSeating, subjectQueues, largest, others, otherRoundRobin, room) {
+  var currentRR = otherRoundRobin;
+  for (var col = 1; col <= room.totalColumns; col++) {
+    if (col % 2 === 1) {
+      if (subjectQueues[largest].length > 0) {
+        fillColumn(roomSeating, subjectQueues[largest], room, col);
+      }
+    } else {
+      var usedOther = null;
+      for (var a = 0; a < others.length; a++) {
+        var idx = (currentRR + a) % others.length;
+        if (subjectQueues[others[idx]].length > 0) {
+          usedOther = others[idx];
+          currentRR = (idx + 1) % others.length;
+          break;
+        }
+      }
+      if (usedOther) {
+        for (var row = 1; row <= room.totalRows; row++) {
+          if (subjectQueues[usedOther].length > 0) {
+            var student = subjectQueues[usedOther].shift();
+            roomSeating.seats.push({
+              rollNo: student.rollNo,
+              section: student.section,
+              courseName: student.courseName,
+              subjectCode: student.subjectCode,
+              subjectName: student.subjectName,
+              row: row,
+              column: col,
+              seatNo: 'R' + row + 'C' + col
+            });
+          }
+        }
+      }
+    }
+  }
+  return currentRR;
+}
+
+function fillRoomWithGaps(roomSeating, studentQueue, room) {
+  for (var col = 1; col <= room.totalColumns; col += 2) {
+    for (var row = 1; row <= room.totalRows; row++) {
+      if (studentQueue.length > 0) {
+        var student = studentQueue.shift();
+        roomSeating.seats.push({
+          rollNo: student.rollNo,
+          section: student.section,
+          courseName: student.courseName,
+          subjectCode: student.subjectCode,
+          subjectName: student.subjectName,
+          row: row,
+          column: col,
+          seatNo: 'R' + row + 'C' + col
+        });
+      } else return;
+    }
+  }
+}
+
+function fillColumn(roomSeating, queue, room, col) {
+  for (var row = 1; row <= room.totalRows; row++) {
+    if (queue.length > 0) {
+      var student = queue.shift();
+      roomSeating.seats.push({
+        rollNo: student.rollNo,
+        section: student.section,
+        courseName: student.courseName,
+        subjectCode: student.subjectCode,
+        subjectName: student.subjectName,
+        row: row,
+        column: col,
+        seatNo: 'R' + row + 'C' + col
+      });
+    }
+  }
+}
+
+function hasRemainingStudents(subjectQueues) {
+  return Object.values(subjectQueues).some(q => q.length > 0);
+}
+
+// ============= OUTPUT FUNCTIONS =============
+function writeSeatingPlan(ss, seatingPlan, controlData) {
+  let outputSheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+  if (outputSheet) ss.deleteSheet(outputSheet);
+  outputSheet = ss.insertSheet(CONFIG.OUTPUT_SHEET);
+  
+  outputSheet.getRange('A1').setValue(controlData.examTitle);
+  outputSheet.getRange('A2').setValue('Date: ' + formatDate(controlData.examDate) + ' | Session: ' + controlData.session);
+  outputSheet.getRange('A3').setValue('Generated on: ' + new Date().toLocaleString());
+  
+  let currentRow = 5;
+  seatingPlan.forEach(room => {
+    outputSheet.getRange(currentRow, 1).setValue('Room: ' + room.roomNo);
+    outputSheet.getRange(currentRow, 3).setValue('Capacity: ' + room.totalRows + ' x ' + room.totalColumns);
+    outputSheet.getRange(currentRow, 5).setValue('Occupied: ' + room.seats.length);
+    currentRow += 2;
+    
+    const headers = ['Roll No', 'Student Name/Course', 'Subject Code', 'Row', 'Column', 'Seat No'];
+    outputSheet.getRange(currentRow, 1, 1, headers.length).setValues([headers]);
+    outputSheet.getRange(currentRow, 1, 1, headers.length).setFontWeight('bold').setBackground('#4a86e8').setFontColor('white');
+    currentRow++;
+    
+    if (room.seats.length > 0) {
+      const seatData = room.seats.map(seat => [
+        seat.rollNo, seat.courseName, seat.subjectCode, seat.row, seat.column, seat.seatNo
+      ]);
+      outputSheet.getRange(currentRow, 1, seatData.length, headers.length).setValues(seatData);
+      currentRow += seatData.length;
+    }
+    currentRow += 2;
+  });
+  
+  outputSheet.autoResizeColumns(1, 6);
+  outputSheet.setFrozenRows(3);
+}
+
+function writeEachRoomAsSeparateSheet(ss, seatingPlan, controlData) {
+  seatingPlan.forEach(room => {
+    const sheetName = room.roomNo.toString();
+    let sheet = ss.getSheetByName(sheetName);
+    if (sheet) ss.deleteSheet(sheet);
+    sheet = ss.insertSheet(sheetName);
+
+    sheet.getRange('A1').setValue(controlData.examTitle).setFontWeight('bold');
+    sheet.getRange('A2').setValue('Date: ' + formatDate(controlData.examDate) + ' | Session: ' + controlData.session);
+    sheet.getRange('A3').setValue('Room: ' + room.roomNo).setFontWeight('bold');
+
+    const headerRow = 4, startRow = 5;
+    const grid = Array.from({ length: room.totalRows + 1 }, () => Array(room.totalColumns).fill(''));
+    const columnHeaders = Array(room.totalColumns).fill('');
+    const columnCounts = Array(room.totalColumns).fill(0);
+    const subjectTotals = {};
+    const courseTotals = {};
+
+    room.seats.forEach(seat => {
+      const r = seat.row - 1, c = seat.column - 1;
+      grid[r][c] = seat.rollNo;
+      columnCounts[c]++;
+      
+      const subjectKey = `${seat.subjectName} (${seat.subjectCode})`;
+      subjectTotals[subjectKey] = (subjectTotals[subjectKey] || 0) + 1;
+      courseTotals[seat.courseName] = (courseTotals[seat.courseName] || 0) + 1;
+      
+      if (!columnHeaders[c]) columnHeaders[c] = subjectKey;
+    });
+
+    for (let c = 0; c < room.totalColumns; c++) {
+      grid[room.totalRows][c] = columnCounts[c] || '';
+    }
+
+    sheet.getRange(headerRow, 1, 1, room.totalColumns).setValues([columnHeaders])
+      .setFontWeight('bold')
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle')
+      .setWrap(true)
+      .setBackground('#eeeeee')
+      .setBorder(true, true, true, true, true, true);
+
+    const gridRange = sheet.getRange(startRow, 1, room.totalRows + 1, room.totalColumns);
+    gridRange.setValues(grid)
+      .setHorizontalAlignment('center')
+      .setVerticalAlignment('middle')
+      .setWrap(true)
+      .setNumberFormat('@')
+      .setBorder(true, true, true, true, true, true);
+
+    sheet.getRange(startRow + room.totalRows, 1, 1, room.totalColumns)
+      .setFontWeight('bold')
+      .setBackground('#f3f3f3');
+
+    let summaryStartRow = startRow + room.totalRows + 2;
+
+    sheet.getRange(summaryStartRow, 1)
+      .setValue('Course-wise Total:')
+      .setFontWeight('bold')
+      .setFontSize(11)
+      .setBackground('#e6f2ff');
+    
+    summaryStartRow++;
+    
+    const subjectKeys = Object.keys(subjectTotals);
+    let col = 1;
+    let currentRow = summaryStartRow;
+    
+    subjectKeys.forEach((subject, index) => {
+      if (col + 1 > room.totalColumns) {
+        col = 1;
+        currentRow++;
+      }
+      
+      sheet.getRange(currentRow, col)
+        .setValue(subject)
+        .setWrap(true)
+        .setFontWeight('bold')
+        .setBackground('#fff2cc')
+        .setBorder(true, true, true, true, true, true);
+      
+      sheet.getRange(currentRow, col + 1)
+        .setValue(subjectTotals[subject])
+        .setHorizontalAlignment('center')
+        .setBackground('#fff2cc')
+        .setBorder(true, true, true, true, true, true);
+      
+      col += 2;
+    });
+
+    summaryStartRow = currentRow + 2;
+
+    sheet.getRange(summaryStartRow, 1)
+      .setValue('Program-wise Total:')
+      .setFontWeight('bold')
+      .setFontSize(11)
+      .setBackground('#e6f2ff');
+    
+    summaryStartRow++;
+    
+    const courseKeys = Object.keys(courseTotals);
+    col = 1;
+    currentRow = summaryStartRow;
+    
+    courseKeys.forEach((course, index) => {
+      if (col + 1 > room.totalColumns) {
+        col = 1;
+        currentRow++;
+      }
+      
+      sheet.getRange(currentRow, col)
+        .setValue(course)
+        .setWrap(true)
+        .setFontWeight('bold')
+        .setBackground('#d9ead3')
+        .setBorder(true, true, true, true, true, true);
+      
+      sheet.getRange(currentRow, col + 1)
+        .setValue(courseTotals[course])
+        .setHorizontalAlignment('center')
+        .setBackground('#d9ead3')
+        .setBorder(true, true, true, true, true, true);
+      
+      col += 2;
+    });
+
+    summaryStartRow = currentRow + 2;
+
+    sheet.getRange(summaryStartRow, 1)
+      .setValue('Grand Total:')
+      .setFontWeight('bold')
+      .setBackground('#ffd966');
+
+    sheet.getRange(summaryStartRow, 2)
+      .setValue(room.seats.length)
+      .setFontWeight('bold')
+      .setHorizontalAlignment('center')
+      .setBackground('#ffd966');
+
+    for (let c = 1; c <= room.totalColumns; c++) {
+      sheet.setColumnWidth(c, 150);
+    }
+    
+    for (let r = startRow; r <= startRow + room.totalRows; r++) {
+      sheet.setRowHeight(r, 55);
+    }
+    
+    sheet.setFrozenRows(4);
+
+    const lastUsedRow = summaryStartRow;
+    const lastUsedCol = room.totalColumns;
+    
+    const totalSheetRows = sheet.getMaxRows();
+    if (totalSheetRows > lastUsedRow) {
+      sheet.deleteRows(lastUsedRow + 1, totalSheetRows - lastUsedRow);
+    }
+    
+    const totalSheetCols = sheet.getMaxColumns();
+    if (totalSheetCols > lastUsedCol) {
+      sheet.deleteColumns(lastUsedCol + 1, totalSheetCols - lastUsedCol);
+    }
+  });
+}
+
+function exportSheetsToDriveFolder(ss, seatingPlan, controlData) {
+  try {
+    const folder = DriveApp.getFolderById(controlData.folderId);
+    
+    const dateStr = controlData.examDate.toString();
+    const sessionStr = controlData.session.toString().trim();
+    const fileName = dateStr + '_' + sessionStr;
+    
+    const spreadsheetFile = DriveApp.getFileById(ss.getId());
+    const copiedFile = spreadsheetFile.makeCopy(fileName, folder);
+    const copiedSS = SpreadsheetApp.openById(copiedFile.getId());
+    
+    const sheetsToKeep = [CONFIG.OUTPUT_SHEET, 'Master Sheet'];
+    seatingPlan.forEach(room => {
+      sheetsToKeep.push(room.roomNo.toString());
+    });
+    
+    const allSheets = copiedSS.getSheets();
+    allSheets.forEach(sheet => {
+      const sheetName = sheet.getName();
+      if (!sheetsToKeep.includes(sheetName)) {
+        copiedSS.deleteSheet(sheet);
+      }
+    });
+    
+    SpreadsheetApp.flush();
+    
+    Logger.log('Spreadsheet exported to folder: ' + folder.getName() + ' as ' + fileName);
+    SpreadsheetApp.getUi().alert('✓ Exported to Drive!\n\nFile: ' + fileName + '\nLocation: ' + folder.getName());
+    
+  } catch (error) {
+    Logger.log('Export to folder failed: ' + error.toString());
+    SpreadsheetApp.getUi().alert('Warning: Could not export to Drive folder.\n\nError: ' + error.toString() + '\n\nPlease check folder ID in Control Panel (B4).');
+  }
+}
+
+// ============= GENERATE ATTENDANCE SHEETS =============
+function generateAttendanceSheets() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    Logger.log('=== Starting Attendance Sheet Generation ===');
+    
+    const controlData = readControlPanel(ss);
+    const students = getEligibleStudents(ss, controlData);
+    
+    if (students.length === 0) {
+      SpreadsheetApp.getUi().alert('No students found for the selected date and session!');
+      return;
+    }
+    
+    const rooms = readRoomData(ss);
+    const subjectGroups = groupStudentsBySubject(students);
+    const seatingPlan = allocateSeats(subjectGroups, rooms, controlData.maxSubjectsPerRoom);  // ← ADDED parameter
+    
+    const studentNameMap = buildStudentNameMap(ss);
+    const attendanceSheets = generateAttendanceSheetsData(seatingPlan, studentNameMap, controlData);
+    
+    if (controlData.folderId) {
+      exportAttendanceToDrive(attendanceSheets, controlData);
+    } else {
+      SpreadsheetApp.getUi().alert('Please set Folder ID in Control Panel (B4) to export attendance sheets.');
+      return;
+    }
+    
+    SpreadsheetApp.getUi().alert('✓ Attendance Sheets Generated!\n\n' +
+      'Total Sheets: ' + attendanceSheets.length + '\n' +
+      'Location: Drive Folder');
+    
+    Logger.log('=== Attendance Sheet Generation Complete ===');
+    
+  } catch (error) {
+    Logger.log('ERROR: ' + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+// CHANGE 1: buildStudentNameMap now includes courseName
+function buildStudentNameMap(ss) {
+  const sheet = ss.getSheetByName(CONFIG.STUDENT_SHEET);
+  const data = sheet.getDataRange().getValues();
+  const nameMap = {};
+  
+  for (let i = 1; i < data.length; i++) {
+    const rollNo = data[i][CONFIG.STUDENT_COLS.ROLL_NO];
+    const name = data[i][CONFIG.STUDENT_COLS.Name];
+    const section = data[i][CONFIG.STUDENT_COLS.Section];
+    const courseName = data[i][CONFIG.STUDENT_COLS.COURSE_NAME];  // ← ADDED
+    if (rollNo) {
+      nameMap[rollNo] = { name: name, section: section, courseName: courseName };  // ← ADDED courseName
+    }
+  }
+  
+  return nameMap;
+}
+
+// CHANGE 2: generateAttendanceSheetsData now includes courseName in student records
+function generateAttendanceSheetsData(seatingPlan, studentNameMap, controlData) {
+  const attendanceSheets = [];
+  
+  seatingPlan.forEach(room => {
+    const subjectGroups = {};
+    
+    room.seats.forEach(seat => {
+      const key = seat.subjectCode;
+      if (!subjectGroups[key]) {
+        subjectGroups[key] = {
+          subjectCode: seat.subjectCode,
+          courseName: seat.courseName,
+          subjectName: seat.subjectName,
+          students: []
+        };
+      }
+      const studentInfo = studentNameMap[seat.rollNo] || { name: 'N/A', section: '', courseName: '' };  // ← ADDED courseName
+      subjectGroups[key].students.push({
+        rollNo: seat.rollNo,
+        name: studentInfo.name,
+        section: studentInfo.section,
+        courseName: studentInfo.courseName,  // ← ADDED
+        seatNo: seat.seatNo
+      });
+    });
+    
+    Object.keys(subjectGroups).forEach(subjectCode => {
+      const group = subjectGroups[subjectCode];
+      
+      group.students.sort((a, b) => {
+        if (a.rollNo < b.rollNo) return -1;
+        if (a.rollNo > b.rollNo) return 1;
+        return 0;
+      });
+      
+      attendanceSheets.push({
+        roomNo: room.roomNo,
+        subjectCode: group.subjectCode,
+        courseName: group.courseName,
+        subjectName: group.subjectName,
+        students: group.students,
+        examDate: controlData.examDate,
+        session: controlData.session,
+        examTitle: controlData.examTitle
+      });
+    });
+  });
+  
+  return attendanceSheets;
+}
+
+function exportAttendanceToDrive(attendanceSheets, controlData) {
+  const folder = DriveApp.getFolderById(controlData.folderId);
+  
+  const dateStr = controlData.examDate.toString();
+  const sessionStr = controlData.session.toString().trim();
+  const subfolderName = 'Attendance_' + dateStr + '_' + sessionStr;
+  
+  const subfolder = folder.createFolder(subfolderName);
+  
+  const attendanceSS = SpreadsheetApp.create('Attendance_' + dateStr + '_' + sessionStr);
+  const attendanceFile = DriveApp.getFileById(attendanceSS.getId());
+  
+  subfolder.addFile(attendanceFile);
+  DriveApp.getRootFolder().removeFile(attendanceFile);
+  
+  const defaultSheet = attendanceSS.getSheets()[0];
+  
+  attendanceSheets.forEach((sheetData, index) => {
+    const sheetName = 'R' + sheetData.roomNo + '_' + sheetData.subjectCode;
+    const sheet = attendanceSS.insertSheet(sheetName);
+    writeAttendanceSheet(sheet, sheetData);
+  });
+  
+  if (attendanceSS.getSheets().length > 1) {
+    attendanceSS.deleteSheet(defaultSheet);
+  }
+  
+  SpreadsheetApp.flush();
+}
+
+// CHANGE 3 & 4: Updated writeAttendanceSheet with Course column + 5 attendance stats fields
+function writeAttendanceSheet(sheet, sheetData) {
+  let row = 1;
+  
+  // Row 1: Exam Title (merged across 6 columns now)
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue(sheetData.examTitle)
+    .setFontWeight('bold')
+    .setFontSize(14)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setBackground('#4a86e8')
+    .setFontColor('white');
+  row++;
+  
+  // Row 2: Date and Session
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue('Date: ' + formatDate(sheetData.examDate) + ' | Session: ' + sheetData.session)
+    .setFontWeight('bold')
+    .setFontSize(11)
+    .setHorizontalAlignment('center')
+    .setBackground('#d9d9d9');
+  row++;
+  
+  // Row 3: Subject Info and Room No
+  sheet.getRange(row, 1, 1, 4).merge()
+    .setValue('Subject: ' + sheetData.subjectName + ' (' + sheetData.subjectCode + ')')
+    .setWrap(true)
+    .setFontWeight('bold')
+    .setFontSize(11)
+    .setVerticalAlignment('middle')
+    .setBackground('#fff2cc');
+  
+  sheet.getRange(row, 5, 1, 2).merge()
+    .setValue('Room No: ' + sheetData.roomNo)
+    .setFontWeight('bold')
+    .setFontSize(11)
+    .setHorizontalAlignment('right')
+    .setVerticalAlignment('middle')
+    .setBackground('#fff2cc');
+  row++;
+  
+  row++; // Blank row
+  
+  // TABLE HEADER — 6 columns now (added Course)
+  const headers = ['S.No', 'Enrollment Number', 'Name of Student', 'Course', 'Section', 'Signature'];
+  sheet.getRange(row, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold')
+    .setFontSize(10)
+    .setHorizontalAlignment('center')
+    .setVerticalAlignment('middle')
+    .setBackground('#434343')
+    .setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  // STUDENT DATA — 6 columns (S.No | Enrollment | Name | Course | Section | Signature)
+  const studentData = sheetData.students.map((student, index) => [
+    index + 1,
+    student.rollNo,
+    student.name,
+    student.courseName,  // ← ADDED Course column
+    student.section,
+    ''
+  ]);
+  
+  if (studentData.length > 0) {
+    sheet.getRange(row, 1, studentData.length, headers.length)
+      .setValues(studentData)
+      .setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true);
+    
+    sheet.getRange(row, 1, studentData.length, 1).setHorizontalAlignment('center'); // S.No
+    sheet.getRange(row, 2, studentData.length, 1).setHorizontalAlignment('center').setNumberFormat('@'); // Enrollment
+    sheet.getRange(row, 3, studentData.length, 1).setHorizontalAlignment('left').setWrap(true);   // Name (WRAP)
+    sheet.getRange(row, 4, studentData.length, 1).setHorizontalAlignment('left').setWrap(true);   // Course (WRAP)
+    sheet.getRange(row, 5, studentData.length, 1).setHorizontalAlignment('center'); // Section
+    sheet.getRange(row, 6, studentData.length, 1).setHorizontalAlignment('center'); // Signature
+    
+    for (let i = 0; i < studentData.length; i++) {
+      const bgColor = (i % 2 === 0) ? '#ffffff' : '#f3f3f3';
+      sheet.getRange(row + i, 1, 1, headers.length).setBackground(bgColor);
+    }
+    
+    row += studentData.length;
+  }
+  
+  row += 2;
+  
+  // Total Students row
+  sheet.getRange(row, 1, 1, 3).merge()
+    .setValue('Total Students: ' + sheetData.students.length)
+    .setFontWeight('bold')
+    .setBackground('#fff2cc');
+  
+  row += 2;
+  
+  // ========= CHANGE 5: ADD 5 ATTENDANCE STATISTICS LINES =========
+  const attendanceStats = [
+    ['Total No of Students:', '________'],
+    ['No of Present Students:', '________'],
+    ['No of Absent Students:', '________'],
+    ['No of Debarred Students:', '________'],
+    ['No of UFM:', '________']
+  ];
+  
+  sheet.getRange(row, 1, attendanceStats.length, 2).setValues(attendanceStats)
+    .setFontWeight('bold')
+    .setBackground('#ffe6cc')
+    .setBorder(true, true, true, true, true, true);
+  
+  sheet.getRange(row, 1, attendanceStats.length, 1).setHorizontalAlignment('left');
+  sheet.getRange(row, 2, attendanceStats.length, 1).setHorizontalAlignment('center');
+  
+  row += attendanceStats.length;
+  row += 3;
+  
+  // Signature section
+  sheet.getRange(row, 1, 1, 3).merge()
+    .setValue('_________________________')
+    .setHorizontalAlignment('center');
+  
+  sheet.getRange(row, 4, 1, 3).merge()
+    .setValue('_________________________')
+    .setHorizontalAlignment('center');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 3).merge()
+    .setValue('Invigilator Signature')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  
+  sheet.getRange(row, 4, 1, 3).merge()
+    .setValue('Centre Superintendent')
+    .setFontWeight('bold')
+    .setHorizontalAlignment('center');
+  
+  // COLUMN WIDTHS — 6 columns
+  sheet.setColumnWidth(1, 60);   // S.No
+  sheet.setColumnWidth(2, 160);  // Enrollment
+  sheet.setColumnWidth(3, 200);  // Name (with wrap)
+  sheet.setColumnWidth(4, 180);  // Course (with wrap)
+  sheet.setColumnWidth(5, 80);   // Section
+  sheet.setColumnWidth(6, 120);  // Signature
+  
+  // ROW HEIGHTS
+  sheet.setRowHeight(1, 35);  // Title
+  sheet.setRowHeight(2, 25);  // Date/Session
+  sheet.setRowHeight(3, 25);  // Subject/Room
+  
+  const startDataRow = 6;
+  for (let r = startDataRow; r < startDataRow + studentData.length; r++) {
+    sheet.setRowHeight(r, 35);  // Student rows (increased for wrap)
+  }
+  
+  sheet.setFrozenRows(5);
+}
+
+// ============= DATE SHEET GENERATION =============
+function generateDateSheet() {
+  const ss = SpreadsheetApp.getActive();
+  const shSource = ss.getSheetByName("Program structure");
+  const shOut = ss.getSheetByName("Date Sheet") || ss.insertSheet("Date Sheet");
+
+  shOut.clear();
+  shOut.getImages().forEach(img => img.remove());
+
+  const data = shSource.getDataRange().getValues();
+  const map = {};
+
+  for (let i = 1; i < data.length; i++) {
+    const program = data[i][0];
+    const subjectName = data[i][1];
+    const subjectCode = data[i][2];
+    const batchYear = data[i][3];
+    const examDate = data[i][4];
+    const session = data[i][5];
+
+    const key = program + " - " + batchYear;
+    if (!map[key]) {
+      map[key] = { year: batchYear, subjects: [] };
+    }
+    map[key].subjects.push([examDate, session, subjectCode, subjectName]);
+  }
+
+  const sortedKeys = Object.keys(map).sort((a, b) => map[b].year - map[a].year);
+
+  let row = 1;
+
+  sortedKeys.forEach((key, index) => {
+    const programData = map[key];
+    const headerStartRow = row;
+
+    shOut.getRange(row, 1, 1, 4).merge().setValue("GD GOENKA UNIVERSITY")
+      .setFontWeight("bold").setFontSize(14).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#d9d9d9");
+    row++;
+
+    shOut.getRange(row, 1, 1, 4).merge().setValue("SCHOOL OF ENGINEERING AND SCIENCES")
+      .setFontWeight("bold").setFontSize(12).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#d9d9d9");
+    row++;
+
+    shOut.getRange(row, 1, 1, 4).merge().setValue("DATE SHEET - MID SEMESTER EXAMINATION")
+      .setFontWeight("bold").setFontSize(11).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#d9d9d9");
+    row++;
+
+    shOut.getRange(row, 1, 1, 4).merge().setValue("ACADEMIC SESSION: 2025-26")
+      .setFontWeight("bold").setFontSize(10).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#d9d9d9");
+    row++;
+
+    shOut.getRange(row, 1, 1, 4).merge().setValue("EVEN SEMESTER (MARCH 2026)")
+      .setFontWeight("bold").setFontSize(10).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#d9d9d9");
+    row++;
+
+    shOut.getRange(row, 1, 1, 4).merge().setValue(key)
+      .setFontWeight("bold").setFontSize(10).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#d9d9d9");
+    row++;
+
+    row++;
+
+    shOut.getRange(row, 1, 1, 4).setValues([["DAY/DATE", "TIME", "COURSE TITLE", "COURSE CODE"]])
+      .setFontWeight("bold").setFontSize(10).setHorizontalAlignment("center")
+      .setVerticalAlignment("middle").setBackground("#bfbfbf").setWrap(true)
+      .setBorder(true, true, true, true, true, true);
+    row++;
+
+    programData.subjects.forEach(item => {
+      const examDate = parseExamDate(item[0]);
+      const dayDate = Utilities.formatDate(examDate, Session.getScriptTimeZone(), "EEEE, dd-MMM-yyyy");
+      const time = item[1] === "Morning" ? "10 AM – 11:30 AM" :
+                   item[1] === "Afternoon" ? "12 Noon – 1:30 PM" : "2 PM – 3:30 PM";
+
+      shOut.getRange(row, 1, 1, 4).setValues([[dayDate, time, item[3], item[2]]])
+        .setFontSize(9).setHorizontalAlignment("center").setVerticalAlignment("middle")
+        .setWrap(true).setBorder(true, true, true, true, true, true);
+      row++;
+    });
+
+    row += 3;
+    shOut.getRange(row, 1, 1, 2).merge().setValue("__________________________").setHorizontalAlignment("center");
+    shOut.getRange(row, 3, 1, 2).merge().setValue("__________________________").setHorizontalAlignment("center");
+    row++;
+
+    shOut.getRange(row, 1, 1, 2).merge().setValue("Head of Department")
+      .setFontWeight("bold").setHorizontalAlignment("center");
+    shOut.getRange(row, 3, 1, 2).merge().setValue("Dean")
+      .setFontWeight("bold").setHorizontalAlignment("center");
+    row++;
+
+    shOut.getRange(row, 1, 1, 2).merge().setValue("GD Goenka University").setHorizontalAlignment("center");
+    shOut.getRange(row, 3, 1, 2).merge().setValue("GD Goenka University").setHorizontalAlignment("center");
+    row++;
+
+    try {
+      const logoBlob = DriveApp.getFileById(CONFIG.LOGO_FILE_ID).getBlob();
+      const logo = shOut.insertImage(logoBlob, headerStartRow, 1);
+      logo.setWidth(CONFIG.LOGO_WIDTH);
+      logo.setHeight(CONFIG.LOGO_HEIGHT);
+      logo.setAnchorCell(shOut.getRange(headerStartRow, 1));
+      logo.setAnchorCellXOffset(5);
+      logo.setAnchorCellYOffset(5);
+    } catch (e) {
+      Logger.log("Logo insert failed for " + key + ": " + e);
+    }
+
+    row += 4;
+  });
+
+  shOut.setColumnWidth(1, 180);
+  shOut.setColumnWidth(2, 150);
+  shOut.setColumnWidth(3, 300);
+  shOut.setColumnWidth(4, 120);
+
+  SpreadsheetApp.getUi().alert("✓ Date Sheet generated!\n\nPrograms sorted by year (newest first).\nUse 'Export Date Sheet to PDF' to download.");
+}
+
+function exportDateSheetsToPDF() {
+  const ss = SpreadsheetApp.getActive();
+  const shOut = ss.getSheetByName("Date Sheet");
+  
+  if (!shOut) {
+    SpreadsheetApp.getUi().alert("Please generate the Date Sheet first!");
+    return;
+  }
+
+  const folderName = "Date Sheets PDF - " + Utilities.formatDate(new Date(), Session.getScriptTimeZone(), "dd-MMM-yyyy HH:mm");
+  const folder = DriveApp.createFolder(folderName);
+
+  const url = "https://docs.google.com/spreadsheets/d/" + ss.getId() +
+    "/export?format=pdf" +
+    "&size=A4" +
+    "&portrait=true" +
+    "&fitw=true" +
+    "&sheetnames=false" +
+    "&printtitle=false" +
+    "&pagenumbers=false" +
+    "&gridlines=false" +
+    "&fzr=false" +
+    "&gid=" + shOut.getSheetId();
+
+  const token = ScriptApp.getOAuthToken();
+  const response = UrlFetchApp.fetch(url, {
+    headers: { Authorization: "Bearer " + token }
+  });
+
+  const blob = response.getBlob().setName("Complete_Date_Sheet.pdf");
+  folder.createFile(blob);
+
+  SpreadsheetApp.getUi().alert("✓ PDF Generated!\n\nLocation:\n" + folder.getUrl());
+}
+
+// ============= MASTER SHEET =============
+function generateMasterSheet() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const controlData = readControlPanel(ss);
+    const students = getEligibleStudents(ss, controlData);
+    
+    if (students.length === 0) {
+      SpreadsheetApp.getUi().alert('No students found!');
+      return;
+    }
+    
+    const rooms = readRoomData(ss);
+    const subjectGroups = groupStudentsBySubject(students);
+    const seatingPlan = allocateSeats(subjectGroups, rooms, controlData.maxSubjectsPerRoom);  // ← ADDED parameter
+    
+    writeMasterSheet(ss, seatingPlan, controlData);
+    SpreadsheetApp.getUi().alert('✓ Master Sheet Generated!');
+    
+  } catch (error) {
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+function writeMasterSheet(ss, seatingPlan, controlData) {
+  const SHEET_NAME = 'Master Sheet';
+  let masterSheet = ss.getSheetByName(SHEET_NAME);
+  if (masterSheet) ss.deleteSheet(masterSheet);
+  masterSheet = ss.insertSheet(SHEET_NAME);
+  
+  let row = 1;
+  masterSheet.getRange(row, 1, 1, 8).merge().setValue(controlData.examTitle)
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center')
+    .setBackground('#4a86e8').setFontColor('white');
+  row++;
+  
+  masterSheet.getRange(row, 1, 1, 8).merge()
+    .setValue('Date: ' + formatDate(controlData.examDate) + ' | Session: ' + controlData.session)
+    .setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center')
+    .setBackground('#6fa8dc').setFontColor('white');
+  row++;
+  
+  masterSheet.getRange(row, 1, 1, 8).merge()
+    .setValue('Master Sheet - Generated: ' + new Date().toLocaleString())
+    .setFontSize(9).setHorizontalAlignment('center').setBackground('#d9d9d9');
+  row += 2;
+  
+  const headers = ['Room No', 'Capacity', 'Allocated', 'Remaining', 'Subjects', 'Subject-wise Roll No Range', 'Subject Count', 'Utilization %'];
+  masterSheet.getRange(row, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center')
+    .setBackground('#434343').setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  const masterData = [];
+  seatingPlan.forEach(room => {
+    const roomCapacity = room.totalRows * room.totalColumns;
+    const allocated = room.seats.length;
+    const remaining = roomCapacity - allocated;
+    
+    const subjectsInRoom = [...new Set(room.seats.map(s => s.subjectCode))];
+    
+    const subjectRollNumbers = {};
+    room.seats.forEach(seat => {
+      if (!subjectRollNumbers[seat.subjectCode]) {
+        subjectRollNumbers[seat.subjectCode] = [];
+      }
+      subjectRollNumbers[seat.subjectCode].push(seat.rollNo);
+    });
+    
+    const subjectRanges = [];
+    Object.keys(subjectRollNumbers).forEach(subjectCode => {
+      const rolls = subjectRollNumbers[subjectCode].sort();
+      const range = rolls[0] + ' - ' + rolls[rolls.length - 1];
+      subjectRanges.push(subjectCode + ': ' + range);
+    });
+    const subjectRangeStr = subjectRanges.join('\n');
+    
+    const subjectCounts = {};
+    room.seats.forEach(s => { 
+      subjectCounts[s.subjectCode] = (subjectCounts[s.subjectCode] || 0) + 1; 
+    });
+    const subjectCountStr = Object.keys(subjectCounts).map(s => s + ': ' + subjectCounts[s]).join('\n');
+    
+    const utilization = ((allocated / roomCapacity) * 100).toFixed(1);
+    
+    masterData.push([
+      room.roomNo, 
+      roomCapacity, 
+      allocated,
+      remaining,
+      subjectsInRoom.join(', '),
+      subjectRangeStr,
+      subjectCountStr, 
+      utilization + '%'
+    ]);
+  });
+  
+  if (masterData.length > 0) {
+    masterSheet.getRange(row, 1, masterData.length, headers.length).setValues(masterData)
+      .setVerticalAlignment('middle').setWrap(true).setBorder(true, true, true, true, true, true);
+    
+    for (let i = 0; i < masterData.length; i++) {
+      const bgColor = (i % 2 === 0) ? '#f3f3f3' : '#ffffff';
+      masterSheet.getRange(row + i, 1, 1, headers.length).setBackground(bgColor);
+    }
+    row += masterData.length;
+  }
+  
+  row += 2;
+  const totalStudents = seatingPlan.reduce((sum, r) => sum + r.seats.length, 0);
+  const totalCapacity = seatingPlan.reduce((sum, r) => sum + (r.totalRows * r.totalColumns), 0);
+  const totalRemaining = totalCapacity - totalStudents;
+  const overallUtilization = ((totalStudents / totalCapacity) * 100).toFixed(1);
+  
+  masterSheet.getRange(row, 1).setValue('SUMMARY').setFontWeight('bold').setFontSize(11).setBackground('#ffd966');
+  row++;
+  
+  const summaryData = [
+    ['Total Rooms:', seatingPlan.length],
+    ['Total Students:', totalStudents],
+    ['Total Capacity:', totalCapacity],
+    ['Total Remaining:', totalRemaining],
+    ['Utilization:', overallUtilization + '%']
+  ];
+  
+  masterSheet.getRange(row, 1, summaryData.length, 2).setValues(summaryData)
+    .setFontWeight('bold').setBackground('#fff2cc');
+  
+  masterSheet.setColumnWidth(1, 100);
+  masterSheet.setColumnWidth(2, 100);
+  masterSheet.setColumnWidth(3, 100);
+  masterSheet.setColumnWidth(4, 100);
+  masterSheet.setColumnWidth(5, 150);
+  masterSheet.setColumnWidth(6, 250);
+  masterSheet.setColumnWidth(7, 180);
+  masterSheet.setColumnWidth(8, 110);
+  masterSheet.setFrozenRows(5);
+}
+
+// ============= UTILITY FUNCTIONS =============
+function formatDate(date) {
+  if (date instanceof Date) {
+    return Utilities.formatDate(date, Session.getScriptTimeZone(), 'M/d/yyyy');
+  }
+  return date.toString();
+}
+
+function parseExamDate(rawDate) {
+  if (rawDate instanceof Date) return rawDate;
+  if (typeof rawDate === "string") {
+    const parts = rawDate.includes("/") ? rawDate.split("/") : rawDate.split("-");
+    const day = parseInt(parts[0], 10);
+    const month = parseInt(parts[1], 10) - 1;
+    const year = parseInt(parts[2], 10);
+    return new Date(year, month, day);
+  }
+  return null;
+}
+
+function clearOldSeatingOutputs_(ss) {
+  const sheets = ss.getSheets();
+  const protectedSheets = ["Students_Input", "Room Data", "Control Panel", "Program structure", 
+                          "Student Details", "Date Sheet", "Master Sheet", "⚠ Exam_Clashes"];
+  
+  sheets.forEach(sh => {
+    const name = sh.getName();
+    if (name === CONFIG.OUTPUT_SHEET) {
+      ss.deleteSheet(sh);
+      return;
+    }
+    if (/^[A-Za-z0-9\-]+$/.test(name) && !protectedSheets.includes(name)) {
+      ss.deleteSheet(sh);
+    }
+  });
+}
+
+function showStatistics() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const controlData = readControlPanel(ss);
+  const students = getEligibleStudents(ss, controlData);
+  const rooms = readRoomData(ss);
+  const totalCapacity = rooms.reduce((sum, room) => sum + room.capacity, 0);
+  const subjectGroups = groupStudentsBySubject(students);
+  
+  let message = '📊 EXAM STATISTICS\n\n';
+  message += '📅 Date: ' + formatDate(controlData.examDate) + '\n';
+  message += '🕐 Session: ' + controlData.session + '\n\n';
+  message += '👥 Total Students: ' + students.length + '\n';
+  message += '🏢 Total Rooms: ' + rooms.length + '\n';
+  message += '💺 Total Capacity: ' + totalCapacity + '\n';
+  message += '📈 Utilization: ' + ((students.length / totalCapacity) * 100).toFixed(1) + '%\n\n';
+  message += '📚 Subjects:\n';
+  
+  Object.keys(subjectGroups).forEach(subject => {
+    message += '  • ' + subject + ': ' + subjectGroups[subject].length + ' students\n';
+  });
+  
+  SpreadsheetApp.getUi().alert(message);
+}
+
+function compileStudentSubjects_FAST() {
+  const ss = SpreadsheetApp.getActive();
+  const shStudents = ss.getSheetByName("Student Details");
+  const shSubjects = ss.getSheetByName("Program structure");
+  const shOut = ss.getSheetByName("Students_Input") || ss.insertSheet("Students_Input");
+
+  const students = shStudents.getDataRange().getValues();
+  const subjects = shSubjects.getDataRange().getValues();
+
+  shOut.clear();
+  const output = [["Roll_No", "Name", "Section", "Course_Name", "Subject_Code", "Subject_Name", "Exam_Date", "Session"]];
+  const subjectMap = {};
+
+  for (let i = 1; i < subjects.length; i++) {
+    const program = subjects[i][0];
+    const subjectName = subjects[i][1];
+    const subjectCode = subjects[i][2];
+    const batchYear = subjects[i][3];
+    const examDate = subjects[i][4];
+    const session = subjects[i][5];
+    const key = program + "_" + batchYear;
+
+    if (!subjectMap[key]) subjectMap[key] = [];
+    subjectMap[key].push([program, subjectCode, subjectName, examDate, session]);
+  }
+
+  for (let i = 1; i < students.length; i++) {
+    const rollNo = students[i][0];
+    const name = students[i][1];
+    const program = students[i][2];
+    const batchYear = students[i][3];
+    const section = students[i][4];
+    const key = program + "_" + batchYear;
+
+    if (subjectMap[key]) {
+      subjectMap[key].forEach(sub =>
+        output.push([rollNo, name, section, sub[0], sub[1], sub[2], sub[3], sub[4]])
+      );
+    }
+  }
+
+  shOut.getRange(1, 1, output.length, output[0].length).setValues(output);
+  SpreadsheetApp.getUi().alert('✓ Student-Subject mapping complete!');
+}
+
+function detectExamClashes_FAST() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName("Students_Input");
+  if (!sh) return;
+
+  const data = sh.getDataRange().getValues();
+  if (data.length <= 1) return;
+
+  const map = Object.create(null);
+  const clashes = [];
+
+  for (let i = 1; i < data.length; i++) {
+    const roll = data[i][0];
+    const name = data[i][1];
+    const subject = data[i][4];
+    const rawDate = data[i][6];
+    const session = data[i][7];
+
+    if (!roll || !rawDate || !session) continue;
+
+    let dateKey;
+    if (rawDate instanceof Date) {
+      dateKey = rawDate.getFullYear() + "-" + (rawDate.getMonth() + 1) + "-" + rawDate.getDate();
+    } else {
+      dateKey = rawDate.replace(/\//g, "-");
+    }
+
+    const key = roll + "|" + dateKey + "|" + session;
+
+    if (!map[key]) {
+      map[key] = { roll, name, date: dateKey, session, subjects: [] };
+    }
+    map[key].subjects.push(subject);
+  }
+
+  for (const k in map) {
+    if (map[k].subjects.length > 1) {
+      clashes.push(map[k]);
+    }
+  }
+
+  if (clashes.length === 0) {
+    SpreadsheetApp.getUi().alert("✅ No exam clashes found");
+    return;
+  }
+
+  const out = ss.getSheetByName("⚠ Exam_Clashes") || ss.insertSheet("⚠ Exam_Clashes");
+  out.clear();
+
+  const result = [["Roll_No", "Name", "Exam_Date", "Session", "Clashing_Subjects"]];
+  clashes.forEach(c => result.push([c.roll, c.name, c.date, c.session, c.subjects.join(", ")]));
+
+  out.getRange(1, 1, result.length, result[0].length).setValues(result);
+  SpreadsheetApp.getUi().alert(`⚠ ${clashes.length} clash(es) found`);
+}
+
+// ============= DUTY ALLOCATION MODULE (UNCHANGED) =============
+const DUTY_CONFIG = {
+  FACULTY_MASTER: 'Faculty_Master',
+  DESIGNATION_CONFIG: 'Designation_Config',
+  INVIGILATOR_RULES: 'Invigilator_Rule_Config',
+  FACULTY_UNAVAILABLE: 'Faculty_Unavailability',
+  DUTY_CHART: 'Duty Allocation Chart',
+  FACULTY_SUMMARY: 'Faculty Duty Summary',
+  FACULTY_COLS: { NAME: 0, EMP_ID: 1, DESIGNATION: 2, DEPARTMENT: 3, AVAILABLE: 4 },
+  DESIGNATION_COLS: { DESIGNATION: 0, MAX_DUTIES: 1 },
+  RULE_COLS: { MIN_STUDENTS: 0, MAX_STUDENTS: 1, INVIGILATORS_REQ: 2 },
+  UNAVAILABLE_COLS: { FACULTY_NAME: 0, DATE: 1, SESSION: 2 }
+};
+
+function generateDutyAllocation() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    Logger.log('=== Starting Duty Allocation Generation ===');
+    
+    validateDutySheets(ss);
+    const config = readDutyConfiguration(ss);
+    
+    // *** CRITICAL FIX: Load duty history from Drive spreadsheet ***
+    const controlData = readControlPanel(ss);
+    loadDutyHistoryFromDrive(config, controlData.folderId);
+    
+    const seatingData = readSeatingArrangement(ss);
+    
+    if (seatingData.length === 0) {
+      SpreadsheetApp.getUi().alert('No seating arrangement found! Please generate seating plan first.');
+      return;
+    }
+    
+    const allocation = allocateDuties(seatingData, config);
+    
+    // *** NEW: Write combined duty allocation to Drive ***
+    writeCombinedDutyAllocationToDrive(allocation, config, seatingData, controlData);
+    
+    SpreadsheetApp.getUi().alert(
+      '✓ Duty Allocation Complete!\n\n' +
+      'New Duties Allocated: ' + allocation.duties.length + '\n' +
+      'Faculty Assigned: ' + allocation.summary.length + '\n' +
+      'Total Cumulative Duties: ' + allocation.totalDuties + '\n\n' +
+      'Saved to Drive: "Duty Allocation Sheet"\n' +
+      '• Tab: ' + formatDate(controlData.examDate) + '_' + controlData.session + '\n' +
+      '• Faculty Summary: See cumulative duties & limits'
+    );
+    
+    Logger.log('=== Duty Allocation Generation Complete ===');
+    
+  } catch (error) {
+    Logger.log('ERROR in Duty Allocation: ' + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+function validateDutySheets(ss) {
+  const requiredSheets = [DUTY_CONFIG.FACULTY_MASTER, DUTY_CONFIG.DESIGNATION_CONFIG, DUTY_CONFIG.INVIGILATOR_RULES];
+  const missing = [];
+  requiredSheets.forEach(sheetName => { if (!ss.getSheetByName(sheetName)) missing.push(sheetName); });
+  if (missing.length > 0) throw new Error('Missing required sheets:\n' + missing.join('\n'));
+}
+
+function loadExistingDutyHistory(ss, config) {
+  const dutySheet = ss.getSheetByName(DUTY_CONFIG.DUTY_CHART);
+  if (!dutySheet) return;
+  
+  const data = dutySheet.getDataRange().getValues();
+  for (let i = 4; i < data.length; i++) {
+    const row = data[i];
+    const faculty = config.facultyByName[row[3]];
+    if (faculty && row[0] && row[1]) {
+      faculty.assignedDuties++;
+      faculty.assignments.push({ date: String(row[0]), session: String(row[1]), roomNo: row[2] });
+    }
+  }
+}
+
+// *** NEW FUNCTION: Load duty history from Drive spreadsheet (for cumulative tracking) ***
+function loadDutyHistoryFromDrive(config, folderId) {
+  const SPREADSHEET_NAME = 'Duty Allocation Sheet';
+  
+  try {
+    // Try to open existing Drive spreadsheet
+    const folder = folderId ? DriveApp.getFolderById(folderId) : DriveApp.getRootFolder();
+    const files = folder.getFilesByName(SPREADSHEET_NAME);
+    
+    if (!files.hasNext()) {
+      Logger.log('No existing duty history found - starting fresh');
+      return;
+    }
+    
+    const file = files.next();
+    const dutySpreadsheet = SpreadsheetApp.openById(file.getId());
+    const sheets = dutySpreadsheet.getSheets();
+    
+    // Scan all session sheets (skip Faculty Summary)
+    sheets.forEach(sheet => {
+      const sheetName = sheet.getName();
+      if (sheetName === 'Faculty Summary' || sheetName === 'Sheet1') return;
+      
+      const data = sheet.getDataRange().getValues();
+      
+      // Find the "ALLOCATED FACULTY" section
+      for (let i = 0; i < data.length; i++) {
+        const cellValue = String(data[i][0]);
+        
+        if (cellValue.includes('ALLOCATED FACULTY')) {
+          // Skip header row
+          i += 2;
+          
+          // Read duty records until we hit empty row or next section
+          while (i < data.length && data[i][0] && !String(data[i][0]).includes('Total Faculty on Duty')) {
+            const facultyName = data[i][3]; // Column D: Faculty Name
+            const date = String(data[i][0]);
+            const session = String(data[i][1]);
+            const roomNo = data[i][2];
+            
+            const faculty = config.facultyByName[facultyName];
+            if (faculty) {
+              faculty.assignedDuties++;
+              faculty.assignments.push({ date: date, session: session, roomNo: roomNo });
+            }
+            i++;
+          }
+          break;
+        }
+      }
+    });
+    
+    const facultyWithDuties = Object.values(config.faculty).filter(f => f.assignedDuties > 0).length;
+    Logger.log('Loaded duty history from Drive: ' + facultyWithDuties + ' faculty with cumulative duties');
+    
+  } catch (error) {
+    Logger.log('Could not load duty history from Drive: ' + error.toString());
+    Logger.log('Starting with fresh duty counts');
+  }
+}
+
+function readDutyConfiguration(ss) {
+  const config = { faculty: {}, facultyByName: {}, designationLimits: {}, invigilatorRules: [], unavailability: {} };
+  
+  const facultyData = ss.getSheetByName(DUTY_CONFIG.FACULTY_MASTER).getDataRange().getValues();
+  for (let i = 1; i < facultyData.length; i++) {
+    const row = facultyData[i];
+    if (!row[1] || !row[0]) continue;
+    const isAvailable = String(row[4]).toUpperCase().trim();
+    if (isAvailable !== 'YES' && isAvailable !== 'Y' && isAvailable !== 'TRUE' && isAvailable !== '1') continue;
+    
+    const faculty = { name: row[0], empId: row[1], designation: row[2], department: row[3], assignedDuties: 0, assignments: [] };
+    config.faculty[row[1]] = faculty;
+    config.facultyByName[row[0]] = faculty;
+  }
+  
+  const designationData = ss.getSheetByName(DUTY_CONFIG.DESIGNATION_CONFIG).getDataRange().getValues();
+  for (let i = 1; i < designationData.length; i++) {
+    if (designationData[i][0]) config.designationLimits[designationData[i][0]] = parseInt(designationData[i][1]);
+  }
+  
+  const rulesData = ss.getSheetByName(DUTY_CONFIG.INVIGILATOR_RULES).getDataRange().getValues();
+  for (let i = 1; i < rulesData.length; i++) {
+    const row = rulesData[i];
+    config.invigilatorRules.push({ minStudents: parseInt(row[0]), maxStudents: parseInt(row[1]), invigilatorsRequired: parseInt(row[2]) });
+  }
+  config.invigilatorRules.sort((a, b) => a.minStudents - b.minStudents);
+  
+  const unavailableSheet = ss.getSheetByName(DUTY_CONFIG.FACULTY_UNAVAILABLE);
+  if (unavailableSheet) {
+    const unavailableData = unavailableSheet.getDataRange().getValues();
+    for (let i = 1; i < unavailableData.length; i++) {
+      const row = unavailableData[i];
+      if (row[0] && row[1] && row[2]) {
+        config.unavailability[row[0] + '|' + formatDate(row[1]) + '|' + String(row[2]).toUpperCase().trim()] = true;
+      }
+    }
+  }
+  
+  return config;
+}
+
+function readSeatingArrangement(ss) {
+  const sheet = ss.getSheetByName(CONFIG.OUTPUT_SHEET);
+  if (!sheet) return [];
+  
+  const data = sheet.getDataRange().getValues();
+  const rooms = [];
+  let currentDate = null, currentSession = null;
+  
+  for (let i = 0; i < data.length; i++) {
+    const cellValue = String(data[i][0]);
+    if (cellValue.includes('Date:')) {
+      const parts = cellValue.split('|');
+      if (parts.length >= 2) {
+        currentDate = parts[0].replace('Date:', '').trim();
+        currentSession = parts[1].replace('Session:', '').trim().toUpperCase();
+      }
+    }
+    if (cellValue.includes('Room:')) {
+      const roomNo = cellValue.replace('Room:', '').trim();
+      const occupiedMatch = String(data[i][4]).match(/\d+/);
+      const studentCount = occupiedMatch ? parseInt(occupiedMatch[0]) : 0;
+      if (roomNo && studentCount > 0 && currentDate && currentSession) {
+        rooms.push({ roomNo: roomNo, date: currentDate, session: currentSession, studentCount: studentCount });
+      }
+    }
+  }
+  return rooms;
+}
+
+function allocateDuties(seatingData, config) {
+  const duties = [];
+  const facultyPool = Object.values(config.faculty);
+  seatingData.sort(() => Math.random() - 0.5);
+  let totalDuties = 0;
+  
+  seatingData.forEach(room => {
+    const invigilatorsNeeded = getInvigilatorsRequired(room.studentCount, config.invigilatorRules);
+    if (invigilatorsNeeded === 0) return;
+    
+    const allocated = [];
+    for (let i = 0; i < invigilatorsNeeded; i++) {
+      const faculty = selectFaculty(facultyPool, room, config, allocated);
+      if (!faculty) throw new Error('Insufficient available faculty for room ' + room.roomNo);
+      
+      allocated.push(faculty);
+      faculty.assignedDuties++;
+      faculty.assignments.push({ date: room.date, session: room.session, roomNo: room.roomNo });
+      totalDuties++;
+    }
+    
+    allocated.forEach(faculty => {
+      duties.push({ date: room.date, session: room.session, roomNo: room.roomNo, facultyName: faculty.name, designation: faculty.designation, empId: faculty.empId });
+    });
+  });
+  
+  const summary = facultyPool.filter(f => f.assignedDuties > 0).map(f => ({
+    facultyName: f.name, empId: f.empId, designation: f.designation, department: f.department,
+    assignedDuties: f.assignedDuties, maxDuties: config.designationLimits[f.designation] || 0,
+    remaining: (config.designationLimits[f.designation] || 0) - f.assignedDuties
+  })).sort((a, b) => b.assignedDuties - a.assignedDuties);
+  
+  return { duties: duties, summary: summary, totalDuties: totalDuties };
+}
+
+function getInvigilatorsRequired(studentCount, rules) {
+  for (let i = 0; i < rules.length; i++) {
+    if (studentCount >= rules[i].minStudents && studentCount <= rules[i].maxStudents) return rules[i].invigilatorsRequired;
+  }
+  return 0;
+}
+
+function selectFaculty(facultyPool, room, config, alreadyAllocated) {
+  const eligible = facultyPool.filter(faculty => {
+    if (alreadyAllocated.includes(faculty)) return false;
+    if (faculty.assignedDuties >= (config.designationLimits[faculty.designation] || 0)) return false;
+    if (faculty.assignments.some(a => a.date === room.date && a.session === room.session)) return false;
+    if (config.unavailability[faculty.name + '|' + room.date + '|' + room.session]) return false;
+    return true;
+  });
+  if (eligible.length === 0) return null;
+  eligible.sort(() => Math.random() - 0.5);
+  eligible.sort((a, b) => a.assignedDuties - b.assignedDuties);
+  return eligible[0];
+}
+
+// *** NEW FUNCTION: Write combined duty allocation to Drive ***
+function writeCombinedDutyAllocationToDrive(allocation, config, seatingData, controlData) {
+  const SPREADSHEET_NAME = 'Duty Allocation Sheet';
+  const currentDate = seatingData[0].date;
+  const currentSession = seatingData[0].session;
+  const sheetName = formatDate(controlData.examDate) + '_' + controlData.session;
+  
+  // Get or create the Drive spreadsheet
+  let dutySpreadsheet = getDutyAllocationSpreadsheet(SPREADSHEET_NAME, controlData.folderId);
+  
+  // Check if sheet with this date/session already exists
+  let sheet = dutySpreadsheet.getSheetByName(sheetName);
+  if (sheet) {
+    dutySpreadsheet.deleteSheet(sheet);
+  }
+  
+  // Create new sheet for this date/session
+  sheet = dutySpreadsheet.insertSheet(sheetName);
+  
+  // Calculate available faculty
+  const assignedFaculty = new Set();
+  allocation.duties.forEach(duty => {
+    if (duty.date === currentDate && duty.session === currentSession) {
+      assignedFaculty.add(duty.facultyName);
+    }
+  });
+  
+  const availableFaculty = Object.values(config.faculty).filter(f => 
+    !assignedFaculty.has(f.name) && 
+    !config.unavailability[f.name + '|' + currentDate + '|' + currentSession]
+  );
+  availableFaculty.sort((a, b) => 
+    a.designation !== b.designation ? 
+    a.designation.localeCompare(b.designation) : 
+    a.name.localeCompare(b.name)
+  );
+  
+  // Write combined sheet
+  writeCombinedDutySheet(sheet, allocation.duties, allocation.summary, availableFaculty, currentDate, currentSession, config);
+  
+  // *** ADD: Create/Update Faculty Summary sheet showing cumulative duties ***
+  writeFacultySummaryToDrive(dutySpreadsheet, allocation.summary, config);
+  
+  Logger.log('Duty allocation saved to Drive: ' + SPREADSHEET_NAME + ' | Sheet: ' + sheetName);
+}
+
+// *** NEW FUNCTION: Get or create duty allocation spreadsheet in Drive ***
+function getDutyAllocationSpreadsheet(spreadsheetName, folderId) {
+  const folder = folderId ? DriveApp.getFolderById(folderId) : DriveApp.getRootFolder();
+  
+  // Search for existing spreadsheet
+  const files = folder.getFilesByName(spreadsheetName);
+  
+  if (files.hasNext()) {
+    const file = files.next();
+    return SpreadsheetApp.openById(file.getId());
+  } else {
+    // Create new spreadsheet
+    const newSpreadsheet = SpreadsheetApp.create(spreadsheetName);
+    const newFile = DriveApp.getFileById(newSpreadsheet.getId());
+    
+    // Move to specified folder
+    if (folderId) {
+      folder.addFile(newFile);
+      DriveApp.getRootFolder().removeFile(newFile);
+    }
+    
+    return newSpreadsheet;
+  }
+}
+
+// *** NEW FUNCTION: Write combined duty and availability sheet ***
+function writeCombinedDutySheet(sheet, duties, summary, availableFaculty, currentDate, currentSession, config) {
+  let row = 1;
+  
+  // ========= SECTION 1: HEADER =========
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue('DUTY ALLOCATION & AVAILABILITY')
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center')
+    .setBackground('#4a86e8').setFontColor('white');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue('Date: ' + currentDate + ' | Session: ' + currentSession)
+    .setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center')
+    .setBackground('#6fa8dc').setFontColor('white');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue('Generated: ' + new Date().toLocaleString())
+    .setFontSize(9).setHorizontalAlignment('center').setBackground('#d9d9d9');
+  row += 2;
+  
+  // ========= SECTION 2: DUTY ALLOCATION =========
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue('ALLOCATED FACULTY (' + duties.length + ' duties)')
+    .setFontWeight('bold').setFontSize(12).setHorizontalAlignment('center')
+    .setBackground('#93c47d').setFontColor('white');
+  row++;
+  
+  const dutyHeaders = ['Date', 'Session', 'Room No', 'Faculty Name', 'Designation', 'Employee ID'];
+  sheet.getRange(row, 1, 1, dutyHeaders.length).setValues([dutyHeaders])
+    .setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center')
+    .setBackground('#434343').setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  if (duties.length > 0) {
+    const dutyData = duties.map(d => [d.date, d.session, d.roomNo, d.facultyName, d.designation, d.empId]);
+    sheet.getRange(row, 1, dutyData.length, dutyHeaders.length)
+      .setValues(dutyData)
+      .setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true);
+    
+    for (let i = 0; i < dutyData.length; i++) {
+      sheet.getRange(row + i, 1, 1, dutyHeaders.length)
+        .setBackground((i % 2 === 0) ? '#d9ead3' : '#ffffff');
+    }
+    row += dutyData.length;
+  }
+  
+  row += 1;
+  
+  // Statistics for allocated faculty
+  const totalAssigned = summary.reduce((sum, s) => sum + s.assignedDuties, 0);
+  const avgDuties = summary.length > 0 ? (totalAssigned / summary.length).toFixed(2) : 0;
+  
+  sheet.getRange(row, 1, 1, 2).merge()
+    .setValue('Total Faculty on Duty:')
+    .setFontWeight('bold').setBackground('#fff2cc');
+  sheet.getRange(row, 3)
+    .setValue(summary.length)
+    .setFontWeight('bold').setBackground('#fff2cc');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 2).merge()
+    .setValue('Total Duties:')
+    .setFontWeight('bold').setBackground('#fff2cc');
+  sheet.getRange(row, 3)
+    .setValue(totalAssigned)
+    .setFontWeight('bold').setBackground('#fff2cc');
+  row++;
+  
+  row += 3; // Gap of 3 rows
+  
+  // ========= SECTION 3: AVAILABLE FACULTY =========
+  sheet.getRange(row, 1, 1, 6).merge()
+    .setValue('AVAILABLE FACULTY (' + availableFaculty.length + ' available)')
+    .setFontWeight('bold').setFontSize(12).setHorizontalAlignment('center')
+    .setBackground('#f4b084').setFontColor('white');
+  row++;
+  
+  const availableHeaders = ['Faculty Name', 'Employee ID', 'Designation', 'Department'];
+  sheet.getRange(row, 1, 1, availableHeaders.length).setValues([availableHeaders])
+    .setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center')
+    .setBackground('#434343').setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  if (availableFaculty.length > 0) {
+    const availableData = availableFaculty.map(f => [f.name, f.empId, f.designation, f.department]);
+    sheet.getRange(row, 1, availableData.length, availableHeaders.length)
+      .setValues(availableData)
+      .setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true);
+    
+    for (let i = 0; i < availableData.length; i++) {
+      sheet.getRange(row + i, 1, 1, availableHeaders.length)
+        .setBackground((i % 2 === 0) ? '#ffe6cc' : '#ffffff');
+    }
+    row += availableData.length;
+  } else {
+    sheet.getRange(row, 1, 1, 6).merge()
+      .setValue('All faculty are either assigned duties or unavailable for this session.')
+      .setFontStyle('italic').setHorizontalAlignment('center')
+      .setBackground('#f4cccc');
+    row++;
+  }
+  
+  row += 1;
+  
+  // Statistics for available faculty
+  const totalFaculty = Object.keys(config.faculty).length;
+  
+  sheet.getRange(row, 1, 1, 2).merge()
+    .setValue('Total Available:')
+    .setFontWeight('bold').setBackground('#fff2cc');
+  sheet.getRange(row, 3)
+    .setValue(availableFaculty.length)
+    .setFontWeight('bold').setBackground('#fff2cc');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 2).merge()
+    .setValue('Total Registered Faculty:')
+    .setFontWeight('bold').setBackground('#fff2cc');
+  sheet.getRange(row, 3)
+    .setValue(totalFaculty)
+    .setFontWeight('bold').setBackground('#fff2cc');
+  
+  // Column widths
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 150);
+  sheet.setColumnWidth(4, 180);
+  sheet.setColumnWidth(5, 150);
+  sheet.setColumnWidth(6, 120);
+  
+  sheet.setFrozenRows(4);
+}
+
+// *** NEW FUNCTION: Write Faculty Summary to Drive spreadsheet ***
+function writeFacultySummaryToDrive(dutySpreadsheet, summary, config) {
+  const SUMMARY_SHEET_NAME = 'Faculty Summary';
+  
+  // Get or create Faculty Summary sheet
+  let summarySheet = dutySpreadsheet.getSheetByName(SUMMARY_SHEET_NAME);
+  if (summarySheet) {
+    dutySpreadsheet.deleteSheet(summarySheet);
+  }
+  summarySheet = dutySpreadsheet.insertSheet(SUMMARY_SHEET_NAME);
+  
+  // Move to first position
+  dutySpreadsheet.setActiveSheet(summarySheet);
+  dutySpreadsheet.moveActiveSheet(1);
+  
+  let row = 1;
+  
+  // Header
+  summarySheet.getRange(row, 1, 1, 7).merge()
+    .setValue('FACULTY DUTY SUMMARY (CUMULATIVE - ALL AVAILABLE FACULTY)')
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center')
+    .setBackground('#6fa8dc').setFontColor('white');
+  row++;
+  
+  summarySheet.getRange(row, 1, 1, 7).merge()
+    .setValue('Last Updated: ' + new Date().toLocaleString())
+    .setFontSize(9).setHorizontalAlignment('center').setBackground('#d9d9d9');
+  row++;
+  
+  summarySheet.getRange(row, 1, 1, 7).merge()
+    .setValue('Shows ALL available faculty and their cumulative duties across all sessions')
+    .setFontSize(9).setHorizontalAlignment('center').setFontStyle('italic').setBackground('#f3f3f3');
+  row += 2;
+  
+  // Column headers
+  const headers = ['Faculty Name', 'Employee ID', 'Designation', 'Department', 'Assigned Duties', 'Max Duties', 'Remaining'];
+  summarySheet.getRange(row, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center')
+    .setBackground('#434343').setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  // *** FIX: Include ALL available faculty (not just those with duties) ***
+  const allFaculty = Object.values(config.faculty).map(f => ({
+    facultyName: f.name,
+    empId: f.empId,
+    designation: f.designation,
+    department: f.department,
+    assignedDuties: f.assignedDuties || 0,
+    maxDuties: config.designationLimits[f.designation] || 0,
+    remaining: (config.designationLimits[f.designation] || 0) - (f.assignedDuties || 0)
+  })).sort((a, b) => b.assignedDuties - a.assignedDuties || a.facultyName.localeCompare(b.facultyName));
+  
+  if (allFaculty.length > 0) {
+    const summaryData = allFaculty.map(s => [
+      s.facultyName, 
+      s.empId, 
+      s.designation,
+      s.department,
+      s.assignedDuties, 
+      s.maxDuties, 
+      s.remaining
+    ]);
+    
+    summarySheet.getRange(row, 1, summaryData.length, headers.length)
+      .setValues(summaryData)
+      .setVerticalAlignment('middle')
+      .setBorder(true, true, true, true, true, true);
+    
+    // Apply conditional formatting and alternating colors
+    for (let i = 0; i < summaryData.length; i++) {
+      const bgColor = (i % 2 === 0) ? '#ffffff' : '#f3f3f3';
+      summarySheet.getRange(row + i, 1, 1, headers.length).setBackground(bgColor);
+      
+      // Highlight remaining capacity
+      const remaining = allFaculty[i].remaining;
+      if (remaining < 0) {
+        // Over limit - RED
+        summarySheet.getRange(row + i, 7).setBackground('#ff0000').setFontColor('white').setFontWeight('bold');
+      } else if (remaining === 0) {
+        // At limit - YELLOW
+        summarySheet.getRange(row + i, 7).setBackground('#ffff00').setFontWeight('bold');
+      } else if (remaining <= 2) {
+        // Near limit - ORANGE
+        summarySheet.getRange(row + i, 7).setBackground('#ffa500').setFontWeight('bold');
+      }
+    }
+    
+    row += summaryData.length;
+  }
+  
+  row += 2;
+  
+  // Statistics
+  const facultyWithDuties = allFaculty.filter(f => f.assignedDuties > 0);
+  const totalAssigned = allFaculty.reduce((sum, s) => sum + s.assignedDuties, 0);
+  const facultyCount = facultyWithDuties.length;
+  const avgDuties = facultyCount > 0 ? (totalAssigned / facultyCount).toFixed(2) : 0;
+  const overLimitCount = allFaculty.filter(s => s.remaining < 0).length;
+  const atLimitCount = allFaculty.filter(s => s.remaining === 0).length;
+  const availableCount = allFaculty.filter(s => s.remaining > 0 && s.assignedDuties === 0).length;
+  
+  summarySheet.getRange(row, 1)
+    .setValue('STATISTICS')
+    .setFontWeight('bold').setFontSize(11).setBackground('#ffd966');
+  row++;
+  
+  const stats = [
+    ['Total Available Faculty:', allFaculty.length],
+    ['Faculty With Duties:', facultyCount],
+    ['Faculty With Zero Duties:', availableCount],
+    ['Total Duties Assigned:', totalAssigned],
+    ['Average Duties (for assigned):', avgDuties],
+    ['Faculty Over Limit:', overLimitCount],
+    ['Faculty At Limit:', atLimitCount]
+  ];
+  
+  summarySheet.getRange(row, 1, stats.length, 2)
+    .setValues(stats)
+    .setFontWeight('bold')
+    .setBackground('#fff2cc')
+    .setBorder(true, true, true, true, true, true);
+  
+  // Highlight warnings
+  if (overLimitCount > 0) {
+    summarySheet.getRange(row + 5, 2).setBackground('#ff0000').setFontColor('white');
+  }
+  if (atLimitCount > 0) {
+    summarySheet.getRange(row + 6, 2).setBackground('#ffff00');
+  }
+  
+  // Column widths
+  summarySheet.setColumnWidth(1, 200);
+  summarySheet.setColumnWidth(2, 120);
+  summarySheet.setColumnWidth(3, 150);
+  summarySheet.setColumnWidth(4, 180);
+  summarySheet.setColumnWidth(5, 120);
+  summarySheet.setColumnWidth(6, 100);
+  summarySheet.setColumnWidth(7, 100);
+  
+  summarySheet.setFrozenRows(5);
+  
+  Logger.log('Faculty Summary updated in Drive spreadsheet - showing all ' + allFaculty.length + ' available faculty');
+}
+
+function writeDutyChart(ss, newDuties, appendMode) {
+  const SHEET_NAME = DUTY_CONFIG.DUTY_CHART;
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  let existingData = [];
+  
+  if (appendMode && sheet) {
+    const allData = sheet.getDataRange().getValues();
+    for (let i = 4; i < allData.length; i++) if (allData[i][0]) existingData.push(allData[i]);
+  }
+  
+  if (sheet) ss.deleteSheet(sheet);
+  sheet = ss.insertSheet(SHEET_NAME);
+  
+  let row = 1;
+  sheet.getRange(row, 1, 1, 5).merge().setValue('DUTY ALLOCATION CHART (CUMULATIVE)')
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center')
+    .setBackground('#4a86e8').setFontColor('white');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 5).merge().setValue('Last Updated: ' + new Date().toLocaleString())
+    .setFontSize(9).setHorizontalAlignment('center').setBackground('#d9d9d9');
+  row += 2;
+  
+  const headers = ['Date', 'Session', 'Room No', 'Faculty Name', 'Designation'];
+  sheet.getRange(row, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center')
+    .setBackground('#434343').setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  const allDuties = existingData.map(r => [r[0], r[1], r[2], r[3], r[4]]);
+  if (existingData.length > 0 && newDuties.length > 0) {
+    allDuties.push([`──────── NEW SESSION: ${newDuties[0].date} | ${newDuties[0].session} ────────`, '', '', '', '']);
+  }
+  newDuties.forEach(d => allDuties.push([d.date, d.session, d.roomNo, d.facultyName, d.designation]));
+  
+  if (allDuties.length > 0) {
+    sheet.getRange(row, 1, allDuties.length, headers.length).setValues(allDuties)
+      .setVerticalAlignment('middle').setBorder(true, true, true, true, true, true);
+    if (existingData.length > 0 && newDuties.length > 0) {
+      const sepRow = row + existingData.length;
+      sheet.getRange(sepRow, 1, 1, headers.length).setBackground('#ffe599').setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center');
+      sheet.getRange(sepRow, 1, 1, headers.length).merge();
+    }
+    for (let i = 0; i < allDuties.length; i++) {
+      sheet.getRange(row + i, 1, 1, headers.length).setBackground((i % 2 === 0) ? '#ffffff' : '#f3f3f3');
+    }
+  }
+  
+  sheet.setColumnWidth(1, 120);
+  sheet.setColumnWidth(2, 100);
+  sheet.setColumnWidth(3, 100);
+  sheet.setColumnWidth(4, 200);
+  sheet.setColumnWidth(5, 150);
+  sheet.setFrozenRows(4);
+}
+
+function writeFacultySummary(ss, summary) {
+  const SHEET_NAME = DUTY_CONFIG.FACULTY_SUMMARY;
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (sheet) ss.deleteSheet(sheet);
+  sheet = ss.insertSheet(SHEET_NAME);
+  
+  let row = 1;
+  sheet.getRange(row, 1, 1, 6).merge().setValue('FACULTY DUTY SUMMARY')
+    .setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center')
+    .setBackground('#6fa8dc').setFontColor('white');
+  row++;
+  
+  sheet.getRange(row, 1, 1, 6).merge().setValue('Generated: ' + new Date().toLocaleString())
+    .setFontSize(9).setHorizontalAlignment('center').setBackground('#d9d9d9');
+  row += 2;
+  
+  const headers = ['Faculty Name', 'Employee ID', 'Designation', 'Assigned Duties', 'Max Duties', 'Remaining'];
+  sheet.getRange(row, 1, 1, headers.length).setValues([headers])
+    .setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center')
+    .setBackground('#434343').setFontColor('white')
+    .setBorder(true, true, true, true, true, true);
+  row++;
+  
+  if (summary.length > 0) {
+    const summaryData = summary.map(s => [s.facultyName, s.empId, s.designation, s.assignedDuties, s.maxDuties, s.remaining]);
+    sheet.getRange(row, 1, summaryData.length, headers.length).setValues(summaryData)
+      .setVerticalAlignment('middle').setBorder(true, true, true, true, true, true);
+    
+    for (let i = 0; i < summaryData.length; i++) {
+      sheet.getRange(row + i, 1, 1, headers.length).setBackground((i % 2 === 0) ? '#ffffff' : '#f3f3f3');
+      if (summary[i].remaining < 0) sheet.getRange(row + i, 6).setBackground('#ff0000').setFontColor('white');
+      else if (summary[i].remaining === 0) sheet.getRange(row + i, 6).setBackground('#ffff00');
+    }
+    row += summaryData.length;
+  }
+  
+  row += 2;
+  const totalAssigned = summary.reduce((sum, s) => sum + s.assignedDuties, 0);
+  const avgDuties = summary.length > 0 ? (totalAssigned / summary.length).toFixed(2) : 0;
+  
+  sheet.getRange(row, 1).setValue('STATISTICS').setFontWeight('bold').setBackground('#fff2cc');
+  row++;
+  const stats = [['Total Faculty Assigned:', summary.length], ['Total Duties:', totalAssigned], ['Average Duties per Faculty:', avgDuties]];
+  sheet.getRange(row, 1, stats.length, 2).setValues(stats).setFontWeight('bold').setBackground('#fff2cc');
+  
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 150);
+  sheet.setColumnWidth(4, 120);
+  sheet.setColumnWidth(5, 100);
+  sheet.setColumnWidth(6, 100);
+  sheet.setFrozenRows(4);
+}
+
+function writeAvailableFacultyList(ss, currentSessionDuties, config, seatingData) {
+  const SHEET_NAME = 'Available Faculty List';
+  if (!seatingData || seatingData.length === 0) return;
+  
+  const currentDate = seatingData[0].date, currentSession = seatingData[0].session;
+  const assignedFaculty = new Set();
+  currentSessionDuties.forEach(duty => { if (duty.date === currentDate && duty.session === currentSession) assignedFaculty.add(duty.facultyName); });
+  
+  const availableFaculty = Object.values(config.faculty).filter(f => !assignedFaculty.has(f.name) && !config.unavailability[f.name + '|' + currentDate + '|' + currentSession]);
+  availableFaculty.sort((a, b) => a.designation !== b.designation ? a.designation.localeCompare(b.designation) : a.name.localeCompare(b.name));
+  
+  let sheet = ss.getSheetByName(SHEET_NAME);
+  if (sheet) ss.deleteSheet(sheet);
+  sheet = ss.insertSheet(SHEET_NAME);
+  
+  let row = 1;
+  sheet.getRange(row, 1, 1, 4).merge().setValue('AVAILABLE FACULTY LIST').setFontWeight('bold').setFontSize(14).setHorizontalAlignment('center').setBackground('#93c47d').setFontColor('white');
+  row++;
+  sheet.getRange(row, 1, 1, 4).merge().setValue('Date: ' + currentDate + ' | Session: ' + currentSession).setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center').setBackground('#b6d7a8').setFontColor('black');
+  row++;
+  sheet.getRange(row, 1, 1, 4).merge().setValue('Generated: ' + new Date().toLocaleString()).setFontSize(9).setHorizontalAlignment('center').setBackground('#d9d9d9');
+  row += 2;
+  sheet.getRange(row, 1, 1, 4).merge().setValue('Faculty Available (No Duty): ' + availableFaculty.length).setFontWeight('bold').setFontSize(11).setHorizontalAlignment('center').setBackground('#fff2cc');
+  row += 2;
+  
+  const headers = ['Faculty Name', 'Employee ID', 'Designation', 'Department'];
+  sheet.getRange(row, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setFontSize(10).setHorizontalAlignment('center').setBackground('#434343').setFontColor('white').setBorder(true, true, true, true, true, true);
+  row++;
+  
+  if (availableFaculty.length > 0) {
+    const availableData = availableFaculty.map(f => [f.name, f.empId, f.designation, f.department]);
+    sheet.getRange(row, 1, availableData.length, headers.length).setValues(availableData).setVerticalAlignment('middle').setBorder(true, true, true, true, true, true);
+    for (let i = 0; i < availableData.length; i++) sheet.getRange(row + i, 1, 1, headers.length).setBackground((i % 2 === 0) ? '#d9ead3' : '#ffffff');
+    row += availableData.length;
+  } else {
+    sheet.getRange(row, 1, 1, 4).merge().setValue('All faculty are either assigned duties or unavailable for this session.').setFontStyle('italic').setHorizontalAlignment('center').setBackground('#f4cccc');
+    row++;
+  }
+  
+  row += 2;
+  sheet.getRange(row, 1).setValue('STATISTICS').setFontWeight('bold').setBackground('#fff2cc');
+  row++;
+  const stats = [['Total Available Faculty:', availableFaculty.length], ['Faculty on Duty:', assignedFaculty.size], ['Total Registered Faculty:', Object.values(config.faculty).length]];
+  sheet.getRange(row, 1, stats.length, 2).setValues(stats).setFontWeight('bold').setBackground('#fff2cc');
+  
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 150);
+  sheet.setColumnWidth(4, 180);
+  sheet.setFrozenRows(7);
+}
+
+function createDutyAllocationTemplates() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  createFacultyMasterTemplate(ss);
+  createDesignationConfigTemplate(ss);
+  createInvigilatorRuleTemplate(ss);
+  createFacultyUnavailabilityTemplate(ss);
+  SpreadsheetApp.getUi().alert('✓ Template sheets created!');
+}
+
+function createFacultyMasterTemplate(ss) {
+  let sheet = ss.getSheetByName(DUTY_CONFIG.FACULTY_MASTER);
+  if (sheet) return;
+  sheet = ss.insertSheet(DUTY_CONFIG.FACULTY_MASTER);
+  const headers = ['Faculty Name', 'Employee ID', 'Designation', 'Department', 'Available'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#4a86e8').setFontColor('white');
+  const samples = [['Dr. John Smith', 'EMP001', 'Professor', 'Computer Science', 'Yes'], ['Dr. Jane Doe', 'EMP002', 'Associate Professor', 'Mechanical Engineering', 'Yes']];
+  sheet.getRange(2, 1, samples.length, headers.length).setValues(samples);
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 180);
+  sheet.setColumnWidth(4, 200);
+  sheet.setColumnWidth(5, 100);
+}
+
+function createDesignationConfigTemplate(ss) {
+  let sheet = ss.getSheetByName(DUTY_CONFIG.DESIGNATION_CONFIG);
+  if (sheet) return;
+  sheet = ss.insertSheet(DUTY_CONFIG.DESIGNATION_CONFIG);
+  const headers = ['Designation', 'Max_Duties'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#6fa8dc').setFontColor('white');
+  const samples = [['Professor', 10], ['Associate Professor', 12]];
+  sheet.getRange(2, 1, samples.length, headers.length).setValues(samples);
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 120);
+}
+
+function createInvigilatorRuleTemplate(ss) {
+  let sheet = ss.getSheetByName(DUTY_CONFIG.INVIGILATOR_RULES);
+  if (sheet) return;
+  sheet = ss.insertSheet(DUTY_CONFIG.INVIGILATOR_RULES);
+  const headers = ['Min_Students', 'Max_Students', 'Invigilators_Required'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#f4b084').setFontColor('white');
+  const samples = [[1, 20, 1], [21, 40, 2], [41, 60, 3]];
+  sheet.getRange(2, 1, samples.length, headers.length).setValues(samples);
+  sheet.setColumnWidth(1, 150);
+  sheet.setColumnWidth(2, 150);
+  sheet.setColumnWidth(3, 200);
+}
+
+function createFacultyUnavailabilityTemplate(ss) {
+  let sheet = ss.getSheetByName(DUTY_CONFIG.FACULTY_UNAVAILABLE);
+  if (sheet) return;
+  sheet = ss.insertSheet(DUTY_CONFIG.FACULTY_UNAVAILABLE);
+  const headers = ['Faculty Name', 'Date', 'Session'];
+  sheet.getRange(1, 1, 1, headers.length).setValues([headers]).setFontWeight('bold').setBackground('#c9daf8').setFontColor('black');
+  const samples = [['Dr. John Smith', '2/15/2026', 'Morning']];
+  sheet.getRange(2, 1, samples.length, headers.length).setValues(samples);
+  sheet.setColumnWidth(1, 200);
+  sheet.setColumnWidth(2, 120);
+  sheet.setColumnWidth(3, 120);
+}
+
+function resetDutyAllocation() {
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert('Reset Duty Allocation', 'This will DELETE all existing duty assignments. Continue?', ui.ButtonSet.YES_NO);
+  if (response !== ui.Button.YES) return;
+  
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  [DUTY_CONFIG.DUTY_CHART, DUTY_CONFIG.FACULTY_SUMMARY].forEach(sheetName => {
+    const sheet = ss.getSheetByName(sheetName);
+    if (sheet) ss.deleteSheet(sheet);
+  });
+  ui.alert('✓ Duty allocation reset successfully!');
+}
